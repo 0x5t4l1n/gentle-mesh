@@ -174,9 +174,11 @@ func (r *Registry) PruneStaleNodes() {
 }
 
 // SelectNodeForTask selects the optimal healthy online node to execute a task based on:
-//  1. Agent and tag capabilities (must support requested agent and all required tags).
-//  2. Capacity availability (ActiveTasks < MaxConcurrency; MaxConcurrency <= 0 defaults to 1).
-//  3. Load balancing: selects node with lowest ActiveTasks / MaxConcurrency ratio,
+//  1. Status and heartbeat freshness: a node whose heartbeats stopped is skipped even
+//     while its stored status still says Online, so work is never sent to a dead node.
+//  2. Agent and tag capabilities (must support requested agent and all required tags).
+//  3. Capacity availability (ActiveTasks < MaxConcurrency; MaxConcurrency <= 0 defaults to 1).
+//  4. Load balancing: selects node with lowest ActiveTasks / MaxConcurrency ratio,
 //     tie-breaking on lowest ActiveTasks, then deterministic NodeID.
 func (r *Registry) SelectNodeForTask(agent string, requiredTags ...string) (*protocol.NodeInfo, error) {
 	r.mu.RLock()
@@ -184,7 +186,7 @@ func (r *Registry) SelectNodeForTask(agent string, requiredTags ...string) (*pro
 
 	var matchingOnline []*protocol.NodeInfo
 	for _, node := range r.nodes {
-		if node.Status == protocol.NodeStatusOnline && nodeSupportsAgent(node, agent, requiredTags) {
+		if node.Status == protocol.NodeStatusOnline && r.heartbeatIsFresh(node) && nodeSupportsAgent(node, agent, requiredTags) {
 			matchingOnline = append(matchingOnline, node)
 		}
 	}
@@ -239,6 +241,33 @@ func (r *Registry) SelectNodeForTask(agent string, requiredTags ...string) (*pro
 	}
 
 	return cloneNodeInfo(best), nil
+}
+
+// heartbeatIsFresh reports whether the node's last heartbeat is recent enough to keep
+// sending it work. It applies the same 1.5x heartbeatTimeout that PruneStaleNodes uses
+// to mark a node Degraded, but on read: a node that stopped beating stops being selected
+// immediately, without waiting for the pruning ticker to run.
+func (r *Registry) heartbeatIsFresh(node *protocol.NodeInfo) bool {
+	if r.heartbeatTimeout <= 0 {
+		return true
+	}
+	return time.Since(time.Unix(node.LastHeartbeat, 0)) <= time.Duration(float64(r.heartbeatTimeout)*1.5)
+}
+
+// MarkNodeUnreachable marks a node Degraded after a dispatch failed at the transport
+// level, so it leaves the rotation right away instead of waiting for the heartbeat
+// timeout. It is a soft mark: the next heartbeat restores the node to Online, so one
+// failed dispatch cannot retire an otherwise healthy node.
+func (r *Registry) MarkNodeUnreachable(nodeID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	node, exists := r.nodes[nodeID]
+	if !exists {
+		return ErrNodeNotFound
+	}
+	node.Status = protocol.NodeStatusDegraded
+	return nil
 }
 
 func nodeSupportsAgent(node *protocol.NodeInfo, agent string, requiredTags []string) bool {

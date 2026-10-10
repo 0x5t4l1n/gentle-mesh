@@ -455,3 +455,62 @@ func TestRegistry_ConcurrentAccess(t *testing.T) {
 
 	wg.Wait()
 }
+
+// A node whose heartbeats stopped is skipped even while its stored status still says
+// Online: the selector does not wait for the pruning ticker to notice.
+func TestRegistry_SelectNodeForTaskSkipsStaleHeartbeats(t *testing.T) {
+	timeout := 10 * time.Second
+	reg := registry.NewRegistry(timeout)
+
+	_, _ = reg.RegisterNode(sampleJoinRequest("node-stale", "http://10.0.0.1:8080"))
+	_, _ = reg.RegisterNode(sampleJoinRequest("node-fresh", "http://10.0.0.2:8080"))
+
+	// node-stale beat 16s ago: past 1.5 * 10s, so a prune would mark it Degraded, but no
+	// prune ran, so its stored status is still Online.
+	_ = reg.Heartbeat(protocol.NodeHeartbeatRequest{NodeID: "node-stale", Timestamp: time.Now().Add(-16 * time.Second).Unix()})
+	_ = reg.Heartbeat(protocol.NodeHeartbeatRequest{NodeID: "node-fresh", Timestamp: time.Now().Unix()})
+
+	stale, _ := reg.GetNode("node-stale")
+	if stale.Status != protocol.NodeStatusOnline {
+		t.Fatalf("precondition: the stale node should still say online, got %s", stale.Status)
+	}
+
+	sel, err := reg.SelectNodeForTask("worker")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if sel.NodeID != "node-fresh" {
+		t.Errorf("expected node-fresh (the stale node must be skipped), got %s", sel.NodeID)
+	}
+
+	// With only a stale node left there is no eligible node at all.
+	onlyStale := registry.NewRegistry(timeout)
+	_, _ = onlyStale.RegisterNode(sampleJoinRequest("node-lonely", "http://10.0.0.3:8080"))
+	_ = onlyStale.Heartbeat(protocol.NodeHeartbeatRequest{NodeID: "node-lonely", Timestamp: time.Now().Add(-16 * time.Second).Unix()})
+	if _, err := onlyStale.SelectNodeForTask("worker"); !errors.Is(err, registry.ErrAgentNotSupported) {
+		t.Errorf("expected ErrAgentNotSupported when only a stale node exists, got %v", err)
+	}
+}
+
+// The tie-break stays as it was: among equally loaded nodes the lowest NodeID wins, and
+// it keeps winning while the load is equal (the fix does not change the distribution).
+func TestRegistry_SelectNodeForTaskTieBreakKeepsLowestNodeID(t *testing.T) {
+	reg := registry.NewRegistry(30 * time.Second)
+
+	for _, id := range []string{"node-b", "node-a", "node-c"} {
+		req := sampleJoinRequest(id, "http://10.0.0.1:8080")
+		req.MaxConcurrency = 2
+		_, _ = reg.RegisterNode(req)
+		_ = reg.Heartbeat(protocol.NodeHeartbeatRequest{NodeID: id, ActiveTasks: 0})
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		sel, err := reg.SelectNodeForTask("worker")
+		if err != nil {
+			t.Fatalf("unexpected error on attempt %d: %v", attempt, err)
+		}
+		if sel.NodeID != "node-a" {
+			t.Errorf("attempt %d: expected node-a (lowest NodeID among equals), got %s", attempt, sel.NodeID)
+		}
+	}
+}

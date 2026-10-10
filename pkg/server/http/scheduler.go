@@ -1,6 +1,7 @@
 package http
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log"
@@ -22,11 +23,11 @@ var errNilManagedTask = errors.New("scheduler: nil managed task")
 
 // SchedulerConfig defines the dependencies and initial policy for a TerritoryScheduler.
 type SchedulerConfig struct {
-	Mode             protocol.TerritoryMode
-	TaskManager      *task.TaskManager
-	TerritoryManager *federation.TerritoryManager
-	Registry         *registry.Registry
-	Runner           runner.Runner
+	Mode              protocol.TerritoryMode
+	TaskManager       *task.TaskManager
+	TerritoryManager  *federation.TerritoryManager
+	Registry          *registry.Registry
+	Runner            runner.Runner
 	WebhookDispatcher *webhook.Dispatcher
 }
 
@@ -41,10 +42,10 @@ type TerritoryScheduler struct {
 	queue   []*task.ManagedTask
 	running map[string]*task.ManagedTask
 
-	taskManager      *task.TaskManager
-	territoryManager *federation.TerritoryManager
-	registry         *registry.Registry
-	runner           runner.Runner
+	taskManager       *task.TaskManager
+	territoryManager  *federation.TerritoryManager
+	registry          *registry.Registry
+	runner            runner.Runner
 	webhookDispatcher *webhook.Dispatcher
 }
 
@@ -58,13 +59,13 @@ func NewTerritoryScheduler(cfg SchedulerConfig) *TerritoryScheduler {
 	}
 
 	s := &TerritoryScheduler{
-		mode:             mode,
-		queue:            make([]*task.ManagedTask, 0),
-		running:          make(map[string]*task.ManagedTask),
-		taskManager:      cfg.TaskManager,
-		territoryManager: cfg.TerritoryManager,
-		registry:         cfg.Registry,
-		runner:           cfg.Runner,
+		mode:              mode,
+		queue:             make([]*task.ManagedTask, 0),
+		running:           make(map[string]*task.ManagedTask),
+		taskManager:       cfg.TaskManager,
+		territoryManager:  cfg.TerritoryManager,
+		registry:          cfg.Registry,
+		runner:            cfg.Runner,
 		webhookDispatcher: cfg.WebhookDispatcher,
 	}
 
@@ -314,6 +315,8 @@ func (s *TerritoryScheduler) startRunner(mt *task.ManagedTask) {
 					Message: fmt.Sprintf("runner panicked: %v", rec),
 					Fatal:   true,
 				})
+				// A panicking runner leaves the task running forever otherwise.
+				s.failTask(mt, "RUNNER_PANIC", fmt.Sprintf("runner panicked: %v", rec))
 			}
 			// Notify webhooks if dispatcher is configured
 			if s.webhookDispatcher != nil {
@@ -332,13 +335,41 @@ func (s *TerritoryScheduler) startRunner(mt *task.ManagedTask) {
 				s.handleRetry(mt, err)
 				return // Don't call complete, retry will do it
 			}
-			// No retry configured - mark as failed
-			err2 := mt.SetStatus(protocol.TaskStatusFailed)
-			if err2 != nil {
-				// Log but don't fail
-			}
+			// No retry configured: fail the task with an explicit cause, so the state, the
+			// SSE error event and the store all carry the reason.
+			code, message := failureCause(err)
+			s.failTask(mt, code, message)
 		}
 	}()
+}
+
+// failTask finalizes a task through the manager so the cause is recorded in the state, the
+// SSE stream and the store. It falls back to the plain status transition when no manager is
+// configured or the task is already terminal.
+func (s *TerritoryScheduler) failTask(mt *task.ManagedTask, code, message string) {
+	if mt == nil {
+		return
+	}
+	if s.taskManager != nil {
+		if err := s.taskManager.FailTask(mt.TaskID, code, message); err == nil {
+			return
+		}
+	}
+	_ = mt.SetStatus(protocol.TaskStatusFailed)
+}
+
+// failureCause classifies a runner error into the stable cause the coordinator reports.
+// The codes match the ones the pi runner emits, so webhook classification (task.timeout)
+// keeps working through this path too.
+func failureCause(err error) (string, string) {
+	switch {
+	case errors.Is(err, context.DeadlineExceeded):
+		return "TASK_TIMEOUT", "task timeout"
+	case errors.Is(err, context.Canceled):
+		return "TASK_CANCELED", "task canceled"
+	default:
+		return "DISPATCH_FAILED", fmt.Sprintf("dispatch failed: %v", err)
+	}
 }
 
 // handleRetry schedules a retry for the task if retries remain.
@@ -353,9 +384,10 @@ func (s *TerritoryScheduler) handleRetry(mt *task.ManagedTask, lastErr error) {
 	}
 
 	if currentRetry >= mt.Request.MaxRetries {
-		// Max retries reached - mark as failed
+		// Max retries reached - fail with the cause of the last attempt
 		log.Printf("scheduler: task %s failed after %d retries: %v", mt.TaskID, currentRetry, lastErr)
-		mt.SetStatus(protocol.TaskStatusFailed)
+		code, message := failureCause(lastErr)
+		s.failTask(mt, code, message)
 		return
 	}
 
@@ -392,8 +424,8 @@ func (s *TerritoryScheduler) handleRetry(mt *task.ManagedTask, lastErr error) {
 		_, _ = mt.EmitEvent(protocol.EventRetry, protocol.RetryPayload{
 			RetryNumber:   nextRetry,
 			MaxRetries:    mt.Request.MaxRetries,
-			RetryAfterSec:  retryDelay,
-			LastError:      lastErr.Error(),
+			RetryAfterSec: retryDelay,
+			LastError:     lastErr.Error(),
 		})
 	}()
 }
@@ -401,7 +433,6 @@ func (s *TerritoryScheduler) handleRetry(mt *task.ManagedTask, lastErr error) {
 // notifyWebhooks sends webhook notifications based on task final status.
 func (s *TerritoryScheduler) notifyWebhooks(mt *task.ManagedTask) {
 	taskState := mt.Snapshot()
-
 
 	switch mt.Status {
 	case protocol.TaskStatusCompleted:

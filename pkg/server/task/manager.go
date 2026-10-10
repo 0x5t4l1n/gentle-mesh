@@ -52,6 +52,17 @@ func (m *TaskManager) Store() store.TaskStore {
 	return m.store
 }
 
+const (
+	// OrphanedTaskCode is the error code recorded for a task that was still pending when the
+	// coordinator stopped: whoever was executing it is gone with that process.
+	OrphanedTaskCode = "COORDINATOR_RESTARTED"
+	// OrphanedTaskMessage is the stable cause those tasks are failed with. It covers running,
+	// preparing and queued tasks of a previous run: none of them can be resumed or replayed
+	// faithfully, and the client decides whether to send the work again. The coordinator never
+	// retries or re-queues them on its own, because that could execute the same task twice.
+	OrphanedTaskMessage = "coordinator restarted"
+)
+
 // NewTaskManager creates a new TaskManager storing JSONL logs in tasksDir.
 func NewTaskManager(tasksDir string, taskTTL time.Duration, opts ...TaskManagerOption) (*TaskManager, error) {
 	if err := os.MkdirAll(tasksDir, 0755); err != nil {
@@ -81,6 +92,23 @@ func NewTaskManager(tasksDir string, taskTTL time.Duration, opts ...TaskManagerO
 				continue
 			}
 			m.tasks[rec.TaskID] = m.rehydrateTask(rec)
+		}
+
+		// No pending task of a previous run can be resumed or replayed faithfully. A running
+		// (or preparing) one lost the runner that owned it with the process, and a queued one
+		// cannot be reconstructed: the stored row keeps neither the task text nor the
+		// priority, so re-enqueuing it would run an empty prompt in an arbitrary order. Every
+		// non-terminal task is therefore failed with an explicit cause, and it is never
+		// retried or re-queued, because that could execute the same work twice; the client
+		// decides whether to send it again.
+		for _, t := range m.tasks {
+			if t == nil {
+				continue
+			}
+			switch t.CurrentStatus() {
+			case protocol.TaskStatusRunning, protocol.TaskStatusPreparing, protocol.TaskStatusQueued:
+				_ = m.FailTask(t.TaskID, OrphanedTaskCode, OrphanedTaskMessage)
+			}
 		}
 	}
 
@@ -332,6 +360,43 @@ func (m *TaskManager) CancelTask(taskID string, reason string) error {
 
 	task.notifyUpdate()
 	return nil
+}
+
+// FailTask finalizes a task with an explicit cause.
+//
+// It records the error payload, emits an EventError so the cause reaches the SSE stream and
+// the JSONL log (unless the task already carries one, as the pi runner does), and moves the
+// task to failed. The state transition persists status and message through the store.
+func (m *TaskManager) FailTask(taskID, code, message string) error {
+	m.mu.RLock()
+	task, exists := m.tasks[taskID]
+	m.mu.RUnlock()
+	if !exists {
+		return ErrTaskNotFound
+	}
+
+	payload := protocol.ErrorPayload{Code: code, Message: message, Fatal: true}
+
+	task.mu.Lock()
+	if task.isTerminalLocked() {
+		task.mu.Unlock()
+		return ErrTaskAlreadyFinished
+	}
+	alreadyReported := task.Error != nil
+	task.Error = &payload
+	hasLogger := task.logger != nil
+	task.mu.Unlock()
+
+	if !alreadyReported && hasLogger {
+		// Emitting an EventError also records the payload and moves the task to failed.
+		if _, err := task.EmitEvent(protocol.EventError, payload); err != nil {
+			return err
+		}
+	}
+	if task.CurrentStatus() == protocol.TaskStatusFailed {
+		return nil
+	}
+	return task.TransitionTo(protocol.TaskStatusFailed)
 }
 
 // SubmitReply resolves a pending interactive query on a task and acknowledges the response.

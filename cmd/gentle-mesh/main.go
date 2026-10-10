@@ -146,7 +146,7 @@ func requireTLSStorage(dbPath string) error {
 func configureCoordinatorTLS(cfg *meshhttp.ServerConfig, tlsDirPath, dbPath string, extraHostnames, extraIPs []string) (*pki.MeshCA, *pki.ServerCert, bool, error) {
 	// Loopback and localhost always stay; -tls-san only adds.
 	hostnames := append(append([]string{}, extraHostnames...), "localhost", "127.0.0.1")
-	ca, serverCert, err := pki.EnsureMeshTLSWithIPs(tlsDirPath, "Gentle Mesh", "mesh-coordinator", hostnames, extraIPs, false)
+	ca, _, err := pki.EnsureMeshTLSWithIPs(tlsDirPath, "Gentle Mesh", "mesh-coordinator", hostnames, extraIPs, false)
 	if err != nil {
 		return nil, nil, false, fmt.Errorf("failed to load TLS certificates: %w", err)
 	}

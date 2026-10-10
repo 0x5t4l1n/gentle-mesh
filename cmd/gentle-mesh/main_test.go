@@ -2127,3 +2127,24 @@ func TestServer_TLSSANsFreshDirDoesNotReportRegeneration(t *testing.T) {
 		t.Fatal("the coordinator did not shut down")
 	}
 }
+
+// The coordinator retires stale nodes a third of the heartbeat timeout apart, with a
+// one-second floor so a small timeout still prunes often enough.
+func TestPruneInterval(t *testing.T) {
+	cases := []struct {
+		timeout time.Duration
+		want    time.Duration
+	}{
+		{30 * time.Second, 10 * time.Second},
+		{5 * time.Second, 5 * time.Second / 3},
+		{3 * time.Second, time.Second},
+		{time.Second, time.Second},
+		{0, time.Second},
+		{-time.Second, time.Second},
+	}
+	for _, tc := range cases {
+		if got := pruneInterval(tc.timeout); got != tc.want {
+			t.Errorf("pruneInterval(%v) = %v, want %v", tc.timeout, got, tc.want)
+		}
+	}
+}

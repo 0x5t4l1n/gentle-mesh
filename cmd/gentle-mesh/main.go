@@ -29,6 +29,7 @@ import (
 	"github.com/gentleman-programming/gentle-mesh/pkg/pki"
 	"github.com/gentleman-programming/gentle-mesh/pkg/protocol"
 	meshhttp "github.com/gentleman-programming/gentle-mesh/pkg/server/http"
+	"github.com/gentleman-programming/gentle-mesh/pkg/server/registry"
 	"github.com/gentleman-programming/gentle-mesh/pkg/server/runner"
 	"github.com/gentleman-programming/gentle-mesh/pkg/server/store"
 	"github.com/gentleman-programming/gentle-mesh/pkg/server/worker"
@@ -136,6 +137,16 @@ func requireTLSStorage(dbPath string) error {
 		return errors.New("-tls requires a SQLite database for enrollment tokens and webhooks; remove -db-path none")
 	}
 	return nil
+}
+
+// pruneInterval returns how often the coordinator retires nodes whose heartbeats stopped:
+// a third of the heartbeat timeout, never less than one second.
+func pruneInterval(heartbeatTimeout time.Duration) time.Duration {
+	interval := heartbeatTimeout / 3
+	if interval < time.Second {
+		interval = time.Second
+	}
+	return interval
 }
 
 // configureCoordinatorTLS loads (or generates) the coordinator TLS material and
@@ -255,6 +266,10 @@ func runServer(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		return err
 	}
 
+	// One registry for the coordinator: the pruning ticker below and the HTTP server
+	// share the same instance.
+	nodeRegistry := registry.NewRegistry(*heartbeatTimeout)
+
 	serverConfig := meshhttp.ServerConfig{
 		Addr:              *addr,
 		TasksDir:          *tasksDir,
@@ -265,6 +280,7 @@ func runServer(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		TerritoryMode:     mode,
 		WorkspaceRoot:     *workspace,
 		Runner:            selectedRunner,
+		Registry:          nodeRegistry,
 		RateLimitRequests: *rateLimitRequests,
 		RateLimitWindow:   *rateLimitWindow,
 		RateLimitBurst:    *rateLimitBurst,
@@ -338,6 +354,22 @@ func runServer(ctx context.Context, args []string, stdout, stderr io.Writer) err
 			errCh <- err
 		}
 		close(errCh)
+	}()
+
+	// Retire nodes whose heartbeats stopped. Without this loop PruneStaleNodes is dead
+	// code: a worker killed without saying goodbye stays Online forever and the router
+	// keeps picking it, so every task sent to it fails.
+	pruneTicker := time.NewTicker(pruneInterval(*heartbeatTimeout))
+	defer pruneTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-pruneTicker.C:
+				nodeRegistry.PruneStaleNodes()
+			}
+		}
 	}()
 
 	select {

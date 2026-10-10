@@ -5,14 +5,23 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 
 	"github.com/gentleman-programming/gentle-mesh/pkg/protocol"
 )
 
+// meshDispatchAttempts bounds how many nodes a single task may be sent to when the
+// previous one never accepted it. A task is never retried after a worker answered.
+const meshDispatchAttempts = 3
+
 // NodeSelector defines the capability to choose an appropriate worker node from the mesh.
 type NodeSelector interface {
 	SelectNodeForTask(agent string, requiredTags ...string) (*protocol.NodeInfo, error)
+	// MarkNodeUnreachable takes a node out of the rotation after a dispatch that failed
+	// before the worker accepted the task.
+	MarkNodeUnreachable(nodeID string) error
 }
 
 // MeshRunnerOptions configures routing, fallback execution, and HTTP connectivity for MeshRunner.
@@ -62,24 +71,24 @@ func (s localExecutionSink) EmitEvent(eventType protocol.EventType, payload any)
 }
 
 // Run attempts to route the task to a selected mesh worker, or delegates to the fallback runner.
+//
+// A dispatch that fails before the worker accepted the task (connection refused, no route,
+// DNS) marks that node unreachable and the task is offered to another node, up to
+// meshDispatchAttempts times. A dispatch that fails after the connection was established,
+// or a task the worker reported as failed, is returned unchanged: retrying it elsewhere
+// could execute it twice.
 func (m *MeshRunner) Run(ctx context.Context, req protocol.TaskRequest, sink EventSink) error {
 	var err error = errors.New("no node selector configured")
 
 	if m.selector != nil {
-		var node *protocol.NodeInfo
-		node, err = m.selector.SelectNodeForTask(req.Agent, req.Tags...)
-		if err == nil && node != nil && node.Endpoint != "" {
-			log.Printf("[mesh-router] dispatching task (agent: %q, tags: %v) -> node %q (endpoint: %s)", req.Agent, req.Tags, node.NodeID, node.Endpoint)
-			remote := NewRemoteRunner(RemoteRunnerConfig{
-				Endpoint: node.Endpoint,
-				Client:   m.client,
-				Token:    m.token,
-			})
-			return remote.Run(ctx, req, sink)
+		dispatchErr, selectErr := m.dispatchToMesh(ctx, req, sink)
+		if dispatchErr == nil && selectErr == nil {
+			return nil
 		}
-		if err == nil {
-			err = errors.New("selected node is nil or missing endpoint")
+		if dispatchErr != nil {
+			return dispatchErr
 		}
+		err = selectErr
 	}
 
 	if m.fallbackRunner != nil {
@@ -88,4 +97,78 @@ func (m *MeshRunner) Run(ctx context.Context, req protocol.TaskRequest, sink Eve
 	}
 
 	return fmt.Errorf("no mesh worker available for task (agent: %q, tags: %v): %w", req.Agent, req.Tags, err)
+}
+
+// dispatchToMesh offers the task to mesh workers.
+//
+// It returns (nil, nil) when a worker ran it, (dispatchErr, nil) when the task reached a
+// worker and failed (or the retry budget ran out), and (nil, selectErr) when no node could
+// be selected, which is the only case the caller answers with the local fallback.
+func (m *MeshRunner) dispatchToMesh(ctx context.Context, req protocol.TaskRequest, sink EventSink) (dispatchErr, selectErr error) {
+	var lastDispatchErr error
+
+	for attempt := 1; attempt <= meshDispatchAttempts; attempt++ {
+		node, err := m.selector.SelectNodeForTask(req.Agent, req.Tags...)
+		if err != nil {
+			if lastDispatchErr != nil {
+				// A dispatch already failed: the task must not be silently executed by the
+				// local fallback, so the dispatch error is what the caller gets.
+				return lastDispatchErr, nil
+			}
+			// Nothing was ever dispatched: this is the "no node available" case, which is
+			// the only one the local fallback answers.
+			return nil, err
+		}
+		if node == nil || node.Endpoint == "" {
+			selErr := errors.New("selected node is nil or missing endpoint")
+			if lastDispatchErr != nil {
+				return lastDispatchErr, nil
+			}
+			return nil, selErr
+		}
+
+		log.Printf("[mesh-router] dispatching task (agent: %q, tags: %v) -> node %q (endpoint: %s)", req.Agent, req.Tags, node.NodeID, node.Endpoint)
+		remote := NewRemoteRunner(RemoteRunnerConfig{
+			Endpoint: node.Endpoint,
+			Client:   m.client,
+			Token:    m.token,
+		})
+
+		runErr := remote.Run(ctx, req, sink)
+		if runErr == nil {
+			return nil, nil
+		}
+		lastDispatchErr = runErr
+
+		if !isPreAcceptanceTransportError(runErr) {
+			// The worker answered, or the task already started: retrying on another node
+			// could run it twice, so the error is reported untouched.
+			return runErr, nil
+		}
+
+		log.Printf("[mesh-router] node %q did not accept the task (%v); marking it unreachable and retrying (attempt %d/%d)",
+			node.NodeID, runErr, attempt, meshDispatchAttempts)
+		if markErr := m.selector.MarkNodeUnreachable(node.NodeID); markErr != nil {
+			log.Printf("[mesh-router] could not mark node %q as unreachable: %v", node.NodeID, markErr)
+		}
+	}
+
+	return lastDispatchErr, nil
+}
+
+// isPreAcceptanceTransportError reports whether err happened before the worker accepted the
+// task: a dial failure (connection refused, no route, DNS, dial timeout). Only those are
+// safe to retry on another node; anything that happened after the connection was
+// established (an HTTP status, a broken stream, a task the worker reported as failed) is not.
+func isPreAcceptanceTransportError(err error) bool {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		err = urlErr.Err
+	}
+	var netErr *net.OpError
+	if errors.As(err, &netErr) {
+		return netErr.Op == "dial"
+	}
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr)
 }

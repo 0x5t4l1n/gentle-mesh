@@ -462,7 +462,9 @@ func runWorker(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	tagsFlag := fs.String("tags", "", "Comma-separated tags (e.g. go,fast)")
 	concurrency := fs.Int("concurrency", 2, "Maximum task concurrency")
 	heartbeatInterval := fs.Duration("heartbeat-interval", 10*time.Second, "Heartbeat ping interval")
-	token := fs.String("token", "", "Optional bearer authentication token")
+	token := fs.String("token", "", "Optional bearer authentication token for the coordinator API; it is also accepted as an inbound credential of the worker HTTP server")
+	workerToken := fs.String("worker-token", "", "Bearer token that protects the worker HTTP server, accepted in addition to -token (required on a non-loopback address unless -insecure-no-auth)")
+	insecureNoAuth := fs.Bool("insecure-no-auth", false, "Allow the worker HTTP server on a non-loopback address without -worker-token")
 	addr := fs.String("addr", "", "Listen address for worker HTTP server (default: port from endpoint or :8081)")
 	caCert := fs.String("ca", "", "Path to mesh CA certificate for TLS verification")
 	caCertHash := fs.String("ca-cert-hash", "", "Expected SHA-256 fingerprint of the CA certificate (format: sha256:<hex>)")
@@ -683,9 +685,31 @@ func runWorker(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		listenAddr = extractPortFromEndpoint(*endpoint)
 	}
 
+	// The worker API accepts both credentials: its own and the coordinator's.
+	// The coordinator dispatches tasks to this worker with its own -token, so
+	// dropping it here would break every dispatch.
+	inboundTokens := make([]string, 0, 2)
+	if *workerToken != "" {
+		inboundTokens = append(inboundTokens, *workerToken)
+	}
+	if *token != "" {
+		inboundTokens = append(inboundTokens, *token)
+	}
+
+	// The worker API runs tasks, so it must not be reachable from the network
+	// without any credential.
+	if !isLoopbackListen(listenAddr) {
+		if len(inboundTokens) == 0 && !*insecureNoAuth {
+			return fmt.Errorf("refusing to serve the worker API on non-loopback address %q without authentication: set -worker-token or -token, or pass -insecure-no-auth", listenAddr)
+		}
+		if len(inboundTokens) == 0 {
+			fmt.Fprintf(stdout, "WARNING: worker API on %s has no authentication (-insecure-no-auth): anyone who can reach it can run tasks\n", listenAddr)
+		}
+	}
+
 	workerSrv := worker.NewServer(worker.ServerConfig{
-		Addr:        listenAddr,
-		BearerToken: *token,
+		Addr:         listenAddr,
+		BearerTokens: inboundTokens,
 	})
 
 	if err := workerSrv.Listen(); err != nil {
@@ -1411,6 +1435,23 @@ func parseCommaSeparated(s string) []string {
 	return result
 }
 
+// isLoopbackListen reports whether a worker listen address only accepts loopback
+// traffic. An empty host (":8080"), 0.0.0.0, :: and any other non-loopback IP or
+// hostname count as reachable from the network.
+func isLoopbackListen(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" {
+		return false
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return strings.EqualFold(host, "localhost")
+}
+
 // extractPortFromEndpoint extracts the port from a worker endpoint URL (e.g. "http://worker-alpha:8081" -> ":8081"),
 // falling back to ":8081" if absent or invalid.
 func extractPortFromEndpoint(endpoint string) string {
@@ -1738,7 +1779,9 @@ func runTokenList(ctx context.Context, args []string, stdout, stderr io.Writer) 
 
 	for _, t := range tokens {
 		status := "active"
-		if t.ExpiresAt != nil && time.Now().After(*t.ExpiresAt) {
+		if t.RevokedAt != nil {
+			status = "revoked"
+		} else if t.ExpiresAt != nil && time.Now().After(*t.ExpiresAt) {
 			status = "expired"
 		} else if t.Uses >= t.MaxUses && t.MaxUses > 0 {
 			status = "used"
@@ -1752,6 +1795,12 @@ func runTokenList(ctx context.Context, args []string, stdout, stderr io.Writer) 
 		fmt.Fprintf(stdout, "    Uses: %d/%d\n", t.Uses, t.MaxUses)
 		if t.UsedAt != nil {
 			fmt.Fprintf(stdout, "    Last used: %s\n", t.UsedAt.Format("2006-01-02 15:04"))
+		}
+		if t.UsedBy != nil {
+			fmt.Fprintf(stdout, "    Used by: %s\n", *t.UsedBy)
+		}
+		if t.RevokedAt != nil {
+			fmt.Fprintf(stdout, "    Revoked: %s\n", t.RevokedAt.Format("2006-01-02 15:04"))
 		}
 		fmt.Fprintln(stdout, "")
 	}
@@ -1787,8 +1836,18 @@ func runTokenRevoke(ctx context.Context, args []string, stdout, stderr io.Writer
 
 	tokenStore := store.NewSQLiteTokenStore(db)
 
-	// Mark as used (effectively revokes by setting uses = max)
-	t, err := tokenStore.UseToken(ctx, *tokenValue)
+	// Revoking marks the row instead of deleting it and instead of the old
+	// "consume a use" trick: the token stops working, no use is spent and the
+	// usage trail (used_by, used_at) stays for audit.
+	before, err := tokenStore.GetToken(ctx, *tokenValue)
+	if err != nil {
+		return fmt.Errorf("failed to read token: %w", err)
+	}
+	if before == nil {
+		return fmt.Errorf("token not found: %s", *tokenValue)
+	}
+
+	t, err := tokenStore.RevokeToken(ctx, *tokenValue)
 	if err != nil {
 		if err.Error() == "token not found" {
 			return fmt.Errorf("token not found: %s", *tokenValue)
@@ -1796,9 +1855,20 @@ func runTokenRevoke(ctx context.Context, args []string, stdout, stderr io.Writer
 		return fmt.Errorf("failed to revoke token: %w", err)
 	}
 
+	if before.RevokedAt != nil {
+		fmt.Fprintf(stdout, "ℹ️  Token was already revoked: %s\n", *tokenValue)
+		fmt.Fprintf(stdout, "  Revoked at: %s\n", before.RevokedAt.Format("2006-01-02 15:04"))
+		return nil
+	}
+
 	fmt.Fprintf(stdout, "✅ Token revoked: %s\n", *tokenValue)
-	fmt.Fprintf(stdout, "  Total uses: %d\n", t.Uses)
-	_ = t // suppress unused
+	if t.RevokedAt != nil {
+		fmt.Fprintf(stdout, "  Revoked at: %s\n", t.RevokedAt.Format("2006-01-02 15:04"))
+	}
+	fmt.Fprintf(stdout, "  Uses: %d/%d\n", t.Uses, t.MaxUses)
+	if t.UsedBy != nil {
+		fmt.Fprintf(stdout, "  Used by: %s\n", *t.UsedBy)
+	}
 
 	return nil
 }

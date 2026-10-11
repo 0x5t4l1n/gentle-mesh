@@ -2148,3 +2148,31 @@ func TestPruneInterval(t *testing.T) {
 		}
 	}
 }
+
+// The -branch flag must spell out its real contract: it books the branch for the coordinator's
+// exclusive lock and is not a checkout (no runner runs git).
+func TestRunBranchFlagDocumentsTheLockContract(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	_ = runCLI(context.Background(), []string{"run", "-h"}, &stdout, &stderr)
+	help := stdout.String() + stderr.String()
+
+	idx := strings.Index(help, "\n  -branch ")
+	if idx < 0 {
+		t.Fatalf("the -branch flag is missing from the help: %s", help)
+	}
+	idx++
+	seccion := help[idx:]
+	if fin := strings.Index(seccion[1:], "\n  -"); fin > 0 {
+		seccion = seccion[:fin+1]
+	}
+	lower := strings.ToLower(seccion)
+	if !strings.Contains(lower, "lock") {
+		t.Errorf("the -branch help must document the lock contract, got %q", seccion)
+	}
+	if !strings.Contains(lower, "not a checkout") {
+		t.Errorf("the -branch help must say it is not a checkout, got %q", seccion)
+	}
+	if !strings.Contains(lower, "git") {
+		t.Errorf("the -branch help must mention that no runner runs git, got %q", seccion)
+	}
+}

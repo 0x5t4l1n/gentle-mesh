@@ -1223,7 +1223,7 @@ func runRun(ctx context.Context, args []string, stdout, stderr io.Writer) error 
 	agent := fs.String("agent", "worker", "Target subagent name")
 	taskFlag := fs.String("task", "", "Subagent task prompt (required)")
 	repo := fs.String("repo", "", "Optional Git repository URL")
-	branch := fs.String("branch", "", "Optional Git branch")
+	branch := fs.String("branch", "", "Git branch this task is booked on: the key of the exclusive branch lock, not a checkout (no runner runs git)")
 	idempotencyKey := fs.String("idempotency-key", "", "Optional idempotency deduplication key")
 	domain := fs.String("domain", "", "Architectural domain (e.g. auth, database, ui)")
 	blastRadius := fs.String("blast-radius", "isolated-branch", "Blast radius scope (e.g. isolated-branch, read-only, shared-schema, breaking-change)")

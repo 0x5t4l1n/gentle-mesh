@@ -264,6 +264,13 @@ go run ./cmd/gentle-mesh run -coordinator http://localhost:8080 \
   -surfaces "pkg/auth/jwt.go"
 ```
 
+> **`-branch` / `git_branch` no es un checkout.** El campo `git_branch` de `POST /v1/tasks` (y el flag `-branch` del CLI)
+> es la **clave del lock de rama**: reserva en exclusiva el par `repo`+`rama` para que dos tareas no trabajen el mismo
+> branch a la vez, y entra en el territorio (conflicto `branch_locked`, `HTTP 409`; en modo `queue` la segunda tarea
+> espera). **Ningún runner ejecuta git**, así que la rama nunca se crea, no se hace checkout ni se valida que exista:
+> sólo se guarda en la columna `branch` de la tarea y en el lock, que vive **en memoria** del coordinador y no sobrevive
+> a un reinicio.
+
 ### Puente Drop-in JSON-RPC (`rpc`) para Open Pi Viewer
 
 Si ya contás con una interfaz gráfica que habla el protocolo RPC de Pi (Open Pi Viewer stock, cockpits móviles o cualquier herramienta que dialogue por `stdin`/`stdout`), no hace falta reescribir el cliente: el subcomando `gentle-mesh rpc` actúa como un **puente transparente drop-in** sobre `stdin`/`stdout`.

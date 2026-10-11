@@ -331,6 +331,15 @@ func (s *Server) handleMeshTerritory(w stdhttp.ResponseWriter, r *stdhttp.Reques
 	writeJSON(w, stdhttp.StatusOK, s.territoryManager.LocalManifest())
 }
 
+// taskWarnings returns the additive advisory notes for an accepted task request. With an empty
+// git_branch it returns nil, so the response stays byte-identical to the pre-warning contract.
+func taskWarnings(req protocol.TaskRequest) []string {
+	if req.GitBranch == "" {
+		return nil
+	}
+	return []string{protocol.GitBranchLockOnlyWarning}
+}
+
 func (s *Server) handleCreateTask(w stdhttp.ResponseWriter, r *stdhttp.Request) {
 	r.Body = stdhttp.MaxBytesReader(w, r.Body, 1<<20)
 	var req protocol.TaskRequest
@@ -364,6 +373,7 @@ func (s *Server) handleCreateTask(w stdhttp.ResponseWriter, r *stdhttp.Request) 
 					Status:    st.Status,
 					EventsURL: "/v1/tasks/" + existingTask.TaskID + "/events",
 					CreatedAt: st.CreatedAt,
+					Warnings: taskWarnings(req),
 				})
 				return
 			}
@@ -419,6 +429,7 @@ func (s *Server) handleCreateTask(w stdhttp.ResponseWriter, r *stdhttp.Request) 
 					Status:    st.Status,
 					EventsURL: "/v1/tasks/" + existingTask.TaskID + "/events",
 					CreatedAt: st.CreatedAt,
+					Warnings: taskWarnings(req),
 				})
 				return
 			}
@@ -450,6 +461,7 @@ func (s *Server) handleCreateTask(w stdhttp.ResponseWriter, r *stdhttp.Request) 
 		Status:    t.CurrentStatus(),
 		EventsURL: "/v1/tasks/" + t.TaskID + "/events",
 		CreatedAt: t.CreatedAt,
+		Warnings: taskWarnings(req),
 	})
 }
 
